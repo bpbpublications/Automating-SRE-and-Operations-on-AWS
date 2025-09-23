@@ -1,0 +1,164 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Step Functions state machine for ASG capacity management"
+
+Parameters:
+  PeakTimeMinSize:
+    Type: Number
+    Default: 2
+    Description: Minimum size during peak hours
+
+  PeakTimeMaxSize:
+    Type: Number
+    Default: 4
+    Description: Maximum size during peak hours
+
+  PeakTimeDesiredCapacity:
+    Type: Number
+    Default: 2
+    Description: Desired capacity during peak hours
+
+  OffPeakMinSize:
+    Type: Number
+    Default: 1
+    Description: Minimum size during off-peak hours
+
+  OffPeakMaxSize:
+    Type: Number
+    Default: 1
+    Description: Maximum size during off-peak hours
+
+  OffPeakDesiredCapacity:
+    Type: Number
+    Default: 1
+    Description: Desired capacity during off-peak hours
+
+Resources:
+  CapacityManagementRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ASGManagementPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - autoscaling:UpdateAutoScalingGroup
+                  - autoscaling:DescribeAutoScalingGroups
+                Resource:
+                  Fn::Sub:
+                    - "arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup::autoScalingGroupName/${asgName}"
+                    - asgName: !ImportValue ASG-Name
+
+  CapacityManagementStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt CapacityManagementRole.Arn
+      Definition:
+        Comment: "State machine for managing ASG capacity"
+        StartAt: CheckTime
+        States:
+          CheckTime:
+            Type: Choice
+            Choices:
+              - Variable: "$.timeOfDay"
+                StringEquals: "peak"
+                Next: ScaleUpForPeak
+              - Variable: "$.timeOfDay"
+                StringEquals: "offPeak"
+                Next: ScaleDownForOffPeak
+
+          ScaleUpForPeak:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:autoscaling:updateAutoScalingGroup
+            Parameters:
+              AutoScalingGroupName: !ImportValue ASG-Name
+              MinSize: !Ref PeakTimeMinSize
+              MaxSize: !Ref PeakTimeMaxSize
+              DesiredCapacity: !Ref PeakTimeDesiredCapacity
+            Retry:
+              - ErrorEquals:
+                  - States.ALL
+                IntervalSeconds: 3
+                MaxAttempts: 3
+                BackoffRate: 2
+            End: true
+
+          ScaleDownForOffPeak:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:autoscaling:updateAutoScalingGroup
+            Parameters:
+              AutoScalingGroupName: !ImportValue ASG-Name
+              MinSize: !Ref OffPeakMinSize
+              MaxSize: !Ref OffPeakMaxSize
+              DesiredCapacity: !Ref OffPeakDesiredCapacity
+            Retry:
+              - ErrorEquals:
+                  - States.ALL
+                IntervalSeconds: 3
+                MaxAttempts: 3
+                BackoffRate: 2
+            End: true
+
+  MorningScaleUpRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Trigger scale up at start of business hours"
+      ScheduleExpression: "cron(0 8 ? * MON-FRI *)"
+      State: ENABLED
+      Targets:
+        - Arn: !Ref CapacityManagementStateMachine
+          Id: "MorningScaleUp"
+          RoleArn: !GetAtt EventsRole.Arn
+          Input: '{"timeOfDay": "peak"}'
+
+  EveningScaleDownRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Trigger scale down at end of business hours"
+      ScheduleExpression: "cron(0 18 ? * MON-FRI *)"
+      State: ENABLED
+      Targets:
+        - Arn: !Ref CapacityManagementStateMachine
+          Id: "EveningScaleDown"
+          RoleArn: !GetAtt EventsRole.Arn
+          Input: '{"timeOfDay": "offPeak"}'
+
+  EventsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsInvokePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref CapacityManagementStateMachine
+
+Outputs:
+  StateMachineArn:
+    Description: ARN of the Step Functions state machine
+    Value: !Ref CapacityManagementStateMachine
+
+  MorningScaleUpRuleArn:
+    Description: ARN of the morning scale up rule
+    Value: !GetAtt MorningScaleUpRule.Arn
+
+  EveningScaleDownRuleArn:
+    Description: ARN of the evening scale down rule
+    Value: !GetAtt EveningScaleDownRule.Arn
